@@ -35,12 +35,16 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellCopyContext;
 import org.apache.poi.ss.usermodel.CellCopyPolicy;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
-import org.apache.poi.xssf.usermodel.XSSFSheet;
-import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.ss.util.CellUtil;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -167,21 +171,14 @@ public class SplitExcel extends AbstractProcessor {
                 int index = 0;
                 for (final Sheet originalSheet : originalWorkbook) {
                     final String originalSheetName = originalSheet.getSheetName();
-                    try (XSSFWorkbook newWorkbook = new XSSFWorkbook()) {
-                        XSSFSheet newSheet = newWorkbook.createSheet(originalSheetName);
-                        List<Row> originalRows = new ArrayList<>();
-                        for (Row originalRow : originalSheet) {
-                            originalRows.add(originalRow);
-                        }
-
-                        if (!originalRows.isEmpty()) {
-                            newSheet.copyRows(originalRows, originalSheet.getFirstRowNum(), CELL_COPY_POLICY);
-                        }
+                    try (SXSSFWorkbook newWorkbook = new SXSSFWorkbook()) {
+                        SXSSFSheet newSheet = newWorkbook.createSheet(originalSheetName);
+                        final int numberOfRows = copyRows(originalSheet, newSheet);
 
                         FlowFile newFlowFile = session.create(originalFlowFile);
                         try (final OutputStream out = session.write(newFlowFile)) {
                             newWorkbook.write(out);
-                            workbookSplits.add(new WorkbookSplit(index, newFlowFile, originalSheetName, originalRows.size()));
+                            workbookSplits.add(new WorkbookSplit(index, newFlowFile, originalSheetName, numberOfRows));
                         }
                     }
 
@@ -228,6 +225,92 @@ public class SplitExcel extends AbstractProcessor {
                 .toList();
 
         session.transfer(flowFileSplits, REL_SPLIT);
+    }
+
+    public int copyRows(final Sheet originalSheet, final Sheet destinationSheet) {
+        int rowCount = 0;
+        int srcEndRowNum = 0;
+
+        if (!originalSheet.iterator().hasNext()) {
+            return rowCount;
+        }
+
+        final Row srcStartRow = originalSheet.iterator().next();
+        final int srcStartRowNum = srcStartRow.getRowNum();
+
+        final CellCopyPolicy options = new CellCopyPolicy(CELL_COPY_POLICY);
+        // avoid O(N^2) performance scanning through all regions for each row
+        // merged regions will be copied after all the rows have been copied
+        options.setCopyMergedRegions(false);
+
+        final CellCopyContext cellCopyContext = new CellCopyContext();
+        for (Row srcRow : originalSheet) {
+            final int shift = (srcRow.getRowNum() - srcStartRowNum);
+            final int destRowNum = originalSheet.getFirstRowNum() + shift;
+            final Row destRow = destinationSheet.createRow(destRowNum);
+            copyRowFrom(srcRow, destRow, cellCopyContext);
+
+            srcEndRowNum = srcRow.getRowNum();
+            ++rowCount;
+        }
+
+        // ======================
+        // Only do additional copy operations here that cannot be done with Row.copyFromRow(Row, options)
+        // reasons: operation needs to interact with multiple rows or sheets
+
+        // Copy merged regions that are contained within the copy region
+        if (CELL_COPY_POLICY.isCopyMergedRegions()) {
+            final int shift = originalSheet.getFirstRowNum() - srcStartRowNum;
+            for (CellRangeAddress srcRegion : srcStartRow.getSheet().getMergedRegions()) {
+                if (srcStartRowNum <= srcRegion.getFirstRow() && srcRegion.getLastRow() <= srcEndRowNum) {
+                    // srcRegion is fully inside the copied rows
+                    final CellRangeAddress destRegion = srcRegion.copy();
+                    destRegion.setFirstRow(destRegion.getFirstRow() + shift);
+                    destRegion.setLastRow(destRegion.getLastRow() + shift);
+                    destinationSheet.addMergedRegion(destRegion);
+                }
+            }
+        }
+
+        return rowCount;
+    }
+
+    private void copyRowFrom(Row srcRow, Row destRow, CellCopyContext context) {
+        if (srcRow == null) {
+            // srcRow is blank. Overwrite cells with blank values, blank styles, etc per cell copy policy
+            for (Cell destCell : destRow) {
+                CellUtil.copyCell(null, destCell, CELL_COPY_POLICY, context);
+            }
+
+            if (CELL_COPY_POLICY.isCopyRowHeight()) {
+                // clear row height
+                destRow.setHeight((short)-1);
+            }
+
+        } else {
+            for (final Cell c : srcRow) {
+                final Cell destCell = destRow.createCell(c.getColumnIndex());
+                CellUtil.copyCell(c, destCell, CELL_COPY_POLICY, context);
+            }
+
+            final int srcRowNum = srcRow.getRowNum();
+            final int destRowNum = destRow.getRowNum();
+
+            if (CELL_COPY_POLICY.isCopyMergedRegions()) {
+                for (CellRangeAddress srcRegion : srcRow.getSheet().getMergedRegions()) {
+                    if (srcRowNum == srcRegion.getFirstRow() && srcRowNum == srcRegion.getLastRow()) {
+                        CellRangeAddress destRegion = srcRegion.copy();
+                        destRegion.setFirstRow(destRowNum);
+                        destRegion.setLastRow(destRowNum);
+                        destRow.getSheet().addMergedRegion(destRegion);
+                    }
+                }
+            }
+
+            if (CELL_COPY_POLICY.isCopyRowHeight()) {
+                destRow.setHeight(srcRow.getHeight());
+            }
+        }
     }
 
     private record WorkbookSplit(int index, FlowFile content, String sheetName, int numRows) {
